@@ -7,6 +7,10 @@ on:
         description: Source ref in lawrence-millard/l7code (branch, tag, or commit)
         required: true
         default: main
+      force:
+        description: Build even if this commit is already published
+        type: boolean
+        default: false
   schedule:
     # The source repo is private, so it cannot trigger this workflow directly.
     # Poll instead: every half hour, build main when its HEAD is not in a release yet.
@@ -32,10 +36,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          REF: ${{ inputs.ref || 'main' }}
+          FORCE: ${{ inputs.force || 'false' }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "Manual dispatch always builds." >&2
+          if [[ "$FORCE" == "true" ]]; then
+            echo "Forced." >&2
             echo "build=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -44,17 +50,19 @@ jobs:
           printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$key"
           chmod 600 "$key"
           export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-          sha=$(git ls-remote "git@github.com:lawrence-millard/l7code.git" refs/heads/main | cut -f1)
+          sha=$(git ls-remote "git@github.com:lawrence-millard/l7code.git" "$REF" | cut -f1)
           rm -f "$key"
+          # A bare commit id resolves to nothing; treat the input as the commit.
+          sha="${sha:-$REF}"
           short="${sha:0:7}"
 
-          # Publish release notes name the built commit, so this is the build marker.
+          # Release notes name the built commit, so they double as the build marker.
           built=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].body')
           if grep -qF "@$short" <<< "$built"; then
-            echo "main@$short is already published; skipping." >&2
+            echo "$REF@$short is already published; skipping." >&2
             echo "build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "main@$short has no build yet." >&2
+            echo "$REF@$short has no build yet." >&2
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -66,7 +74,7 @@ jobs:
     timeout-minutes: 45
     env:
       SOURCE_REPOSITORY: lawrence-millard/l7code
-      SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || 'main' }}
+      SOURCE_REF: ${{ inputs.ref || 'main' }}
     steps:
       # Not actions/checkout: its submodule cleanup walks the orphaned gitlinks in
       # the vendored .repos tree, which a sparse checkout leaves unpopulated.
