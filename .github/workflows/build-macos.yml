@@ -14,8 +14,8 @@ on:
   push:
     branches: [main]
   schedule:
-    # The source repo requests builds by pushing to main; the cron is only a
-    # fallback for requests that never arrive.
+    # The private source repo cannot start workflows here, so poll its HEAD.
+    # GitHub drops most cron ticks; treat this as a slow fallback, not a timer.
     - cron: "*/30 * * * *"
 
 permissions:
