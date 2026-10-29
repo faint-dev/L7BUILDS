@@ -7,26 +7,71 @@ on:
         description: Source ref in lawrence-millard/l7code (branch, tag, or commit)
         required: true
         default: main
+  schedule:
+    # The source repo is private, so it cannot trigger this workflow directly.
+    # Poll instead: every half hour, build main when its HEAD is not in a release yet.
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-macos-${{ inputs.ref }}
-  cancel-in-progress: true
+  group: build-macos
+  cancel-in-progress: false
 
 jobs:
+  check:
+    name: Check source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.compare.outputs.build }}
+    steps:
+      - name: Compare source HEAD with published builds
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Manual dispatch always builds." >&2
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          key="$RUNNER_TEMP/source_deploy_key"
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          sha=$(git ls-remote "git@github.com:lawrence-millard/l7code.git" refs/heads/main | cut -f1)
+          rm -f "$key"
+          short="${sha:0:7}"
+
+          # Publish release notes name the built commit, so this is the build marker.
+          built=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].body')
+          if grep -qF "@$short" <<< "$built"; then
+            echo "main@$short is already published; skipping." >&2
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "main@$short has no build yet." >&2
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build arm64
+    needs: check
+    if: needs.check.outputs.build == 'true'
     runs-on: macos-14
     timeout-minutes: 45
     env:
       SOURCE_REPOSITORY: lawrence-millard/l7code
-      SOURCE_REF: ${{ inputs.ref }}
+      SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || 'main' }}
     steps:
       # Not actions/checkout: its submodule cleanup walks the orphaned gitlinks in
       # the vendored .repos tree, which a sparse checkout leaves unpopulated.
       - name: Checkout source
+        id: source
         env:
           SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
         run: |
@@ -41,6 +86,7 @@ jobs:
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git -c checkout.workers=0 checkout --detach FETCH_HEAD
           rm -f "$key"
+          echo "sha=$(git rev-parse --short FETCH_HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
@@ -66,10 +112,13 @@ jobs:
           version=$(node -p "require('./apps/desktop/package.json').version")
           tag="v$version"
           notes=$(printf '%s\n\n%s\n' \
-            "macOS arm64 build of L7CODE $version, from ${SOURCE_REPOSITORY}@$(git rev-parse --short FETCH_HEAD)." \
+            "macOS arm64 build of L7CODE $version, from ${SOURCE_REPOSITORY}@${{ steps.source.outputs.sha }}." \
             "Ad-hoc signed, not notarized. On first launch use System Settings → Privacy & Security → Open Anyway if macOS blocks it.")
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" release/*.dmg release/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+            # The check job reads the built commit from these notes, so they must
+            # be rewritten when an existing version is rebuilt from a newer commit.
+            gh release edit "$tag" --notes "$notes" --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" release/*.dmg release/*.zip --repo "$GITHUB_REPOSITORY" --title "L7CODE $version" --notes "$notes"
           fi
