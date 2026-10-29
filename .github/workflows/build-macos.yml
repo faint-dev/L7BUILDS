@@ -11,9 +11,11 @@ on:
         description: Build even if this commit is already published
         type: boolean
         default: false
+  push:
+    branches: [main]
   schedule:
-    # The source repo is private, so it cannot trigger this workflow directly.
-    # Poll instead: every half hour, build main when its HEAD is not in a release yet.
+    # The source repo requests builds by pushing to main; the cron is only a
+    # fallback for requests that never arrive.
     - cron: "*/30 * * * *"
 
 permissions:
